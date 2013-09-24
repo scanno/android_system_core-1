@@ -571,6 +571,11 @@ void load_system_props() {
      */
     vendor_load_properties();
 
+    /* update with vendor-specific property runtime
+     * overrides
+     */
+    vendor_load_properties();
+
     load_recovery_id_prop();
 }
 
