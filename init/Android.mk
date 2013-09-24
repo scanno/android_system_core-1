@@ -83,6 +83,7 @@ LOCAL_SRC_FILES:= \
     ueventd.cpp \
     ueventd_parser.cpp \
     watchdogd.cpp \
+    vendor_init.cpp
 
 ifeq ($(TARGET_HAVE_VMWARE),true)
 LOCAL_CFLAGS += -DSUPPORT_VMW
@@ -129,6 +130,11 @@ LOCAL_CFLAGS += -D_PLATFORM_BASE="\"$(TARGET_PLATFORM_DEVICE_BASE)\""
 endif
 
 LOCAL_CLANG := $(init_clang)
+
+ifneq ($(strip $(TARGET_INIT_VENDOR_LIB)),)
+LOCAL_WHOLE_STATIC_LIBRARIES += $(TARGET_INIT_VENDOR_LIB)
+endif
+
 include $(BUILD_EXECUTABLE)
 
 
