@@ -104,6 +104,18 @@ int SocketClient::sendBinaryMsg(int code, const void *data, int len) {
     return result;
 }
 
+int SocketClient::sendMsgWithCmdNum(int code, const char *msg, int cmdNum) {
+    char *buf;
+    int ret = 0;
+    ret = asprintf(&buf, "%d %d %s", code, cmdNum, msg);
+    /* Send the zero-terminated message */
+    if (ret != -1) {
+        ret = sendMsg(buf);
+        free(buf);
+    }
+    return ret;
+}
+
 // Sends the code (c-string null-terminated).
 int SocketClient::sendCode(int code) {
     char buf[4];
@@ -112,6 +124,9 @@ int SocketClient::sendCode(int code) {
 }
 
 char *SocketClient::quoteArg(const char *arg) {
+    if(arg == NULL) {
+        return NULL; // caller should check the return value
+    }
     int len = strlen(arg);
     char *result = (char *)malloc(len * 2 + 3);
     char *current = result;

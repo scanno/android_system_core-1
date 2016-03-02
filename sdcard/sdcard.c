@@ -43,6 +43,7 @@
 #include <cutils/multiuser.h>
 
 #include <private/android_filesystem_config.h>
+#include <cutils/properties.h> // Motorola a18689 02/23/2012 IKHSS7-7040
 
 /* README
  *
@@ -1651,10 +1652,10 @@ static int read_package_list(struct fuse_global* global) {
     char buf[512];
     while (fgets(buf, sizeof(buf), file) != NULL) {
         char package_name[512];
-        int appid;
+        intptr_t appid;
         char gids[512];
 
-        if (sscanf(buf, "%s %d %*d %*s %*s %s", package_name, &appid, gids) == 3) {
+        if (sscanf(buf, "%s %" SCNdPTR " %*d %*s %*s %s", package_name, &appid, gids) == 3) {
             char* package_name_dup = strdup(package_name);
             hashmapPut(global->package_to_appid, package_name_dup, (void*) (uintptr_t) appid);
         }
@@ -1778,6 +1779,7 @@ static void run(const char* source_path, const char* label, uid_t uid,
     pthread_t thread_default;
     pthread_t thread_read;
     pthread_t thread_write;
+    char prop[PROPERTY_VALUE_MAX]; // Motorola a18689 02/23/2012 IKHSS7-7040
 
     memset(&global, 0, sizeof(global));
     memset(&fuse_default, 0, sizeof(fuse_default));
@@ -1786,6 +1788,14 @@ static void run(const char* source_path, const char* label, uid_t uid,
     memset(&handler_default, 0, sizeof(handler_default));
     memset(&handler_read, 0, sizeof(handler_read));
     memset(&handler_write, 0, sizeof(handler_write));
+
+    // BEGIN Motorola a18689 02/23/2012 IKHSS7-7040
+    property_get("sys.mot.sdcardservice.quit", prop, "");
+    if (strcmp(prop, "true") == 0) {
+        // sdcard service launched just for umount, quit now
+        return;
+    }
+    // END IKSS7-7040
 
     pthread_mutex_init(&global.lock, NULL);
     global.package_to_appid = hashmapCreate(256, str_hash, str_icase_equals);

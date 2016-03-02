@@ -29,6 +29,7 @@
 #include <time.h>
 #include <sys/swap.h>
 #include <dirent.h>
+#include <selinux/selinux.h>
 #include <ext4.h>
 #include <ext4_sb.h>
 #include <ext4_crypt_init_extensions.h>
@@ -57,11 +58,20 @@
 #define F2FS_FSCK_BIN  "/system/bin/fsck.f2fs"
 #define MKSWAP_BIN      "/system/bin/mkswap"
 
+#define MKSWAP_SECURITY_CONTEXT "u:r:toolbox:s0"
+
 #define FSCK_LOG_FILE   "/dev/fscklogs/log"
 
 #define ZRAM_CONF_DEV   "/sys/block/zram0/disksize"
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
+
+#define MAX_MOUNT_RETRIES 2
+
+/* from bootinfo.h */
+#define PU_REASON_WDOG_AP_RESET     0x00008000 /* Bit 15 */
+#define PU_REASON_AP_KERNEL_PANIC   0x00020000 /* Bit 17 */
+#define PU_REASON_HARDWARE_RESET    0x00100000 /* bit 20  */
 
 /*
  * gettime() - returns the time in seconds of the system's monotonic clock or
@@ -86,11 +96,14 @@ static int wait_for_file(const char *filename, int timeout)
     struct stat info;
     time_t timeout_time = gettime() + timeout;
     int ret = -1;
+    int stat_errno = 0;
 
-    while (gettime() < timeout_time && ((ret = stat(filename, &info)) < 0))
+    while (gettime() < timeout_time && ((ret = stat(filename, &info)) < 0)) {
+        stat_errno = errno;
         usleep(10000);
+    }
 
-    return ret;
+    return ret ? -stat_errno : 0;
 }
 
 static void check_fs(char *blk_device, char *fs_type, char *target)
@@ -99,14 +112,23 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
     int ret;
     long tmpmnt_flags = MS_NOATIME | MS_NOEXEC | MS_NOSUID;
     char *tmpmnt_opts = "nomblk_io_submit,errors=remount-ro";
-    char *e2fsck_argv[] = {
-        E2FSCK_BIN,
-        "-y",
-        blk_device
-    };
+    char tmp[PROP_VALUE_MAX];
+    int force = 0;
+
+    ret = __system_property_get("ro.boot.powerup_reason", tmp);
+    if (ret) {
+        force = strtoul(tmp, 0, 16) & (PU_REASON_WDOG_AP_RESET |
+                                       PU_REASON_AP_KERNEL_PANIC |
+                                       PU_REASON_HARDWARE_RESET);
+    }
 
     /* Check for the types of filesystems we know how to check */
     if (!strcmp(fs_type, "ext2") || !strcmp(fs_type, "ext3") || !strcmp(fs_type, "ext4")) {
+        char *e2fsck_argv[] = {
+            E2FSCK_BIN,
+            "-y",
+            blk_device
+        };
         /*
          * First try to mount and unmount the filesystem.  We do this because
          * the kernel is more efficient than e2fsck in running the journal and
@@ -121,21 +143,26 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
          * fix the filesystem.
          */
         errno = 0;
-        ret = mount(blk_device, target, fs_type, tmpmnt_flags, tmpmnt_opts);
-        INFO("%s(): mount(%s,%s,%s)=%d: %s\n",
-             __func__, blk_device, target, fs_type, ret, strerror(errno));
-        if (!ret) {
-            int i;
-            for (i = 0; i < 5; i++) {
-                // Try to umount 5 times before continuing on.
-                // Should we try rebooting if all attempts fail?
-                int result = umount(target);
-                if (result == 0) {
-                    INFO("%s(): unmount(%s) succeeded\n", __func__, target);
-                    break;
+        if (force) {
+            INFO("Forcing full file sysyem check...\n");
+            e2fsck_argv[1] = "-yf";
+        } else {
+            ret = mount(blk_device, target, fs_type, tmpmnt_flags, tmpmnt_opts);
+            INFO("%s(): mount(%s,%s,%s)=%d: %s\n",
+                __func__, blk_device, target, fs_type, ret, strerror(errno));
+            if (!ret) {
+                int i;
+                for (i = 0; i < 5; i++) {
+                    // Try to umount 5 times before continuing on.
+                    // Should we try rebooting if all attempts fail?
+                    int result = umount(target);
+                    if (result == 0) {
+                        INFO("%s(): unmount(%s) succeeded\n", __func__, target);
+                        break;
+                    }
+                    ERROR("%s(): umount(%s)=%d: %s\n", __func__, target, result, strerror(errno));
+                    sleep(1);
                 }
-                ERROR("%s(): umount(%s)=%d: %s\n", __func__, target, result, strerror(errno));
-                sleep(1);
             }
         }
 
@@ -159,12 +186,16 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
             }
         }
     } else if (!strcmp(fs_type, "f2fs")) {
-            char *f2fs_fsck_argv[] = {
-                    F2FS_FSCK_BIN,
-                    "-f",
-                    blk_device
-            };
-        INFO("Running %s -f %s\n", F2FS_FSCK_BIN, blk_device);
+        char *f2fs_fsck_argv[] = {
+            F2FS_FSCK_BIN,
+            "-a",
+            blk_device
+        };
+        if (force) {
+            INFO("Forcing full file sysyem check...\n");
+            f2fs_fsck_argv[1] = "-f";
+        }
+        INFO("Running %s on %s\n", F2FS_FSCK_BIN, blk_device);
 
         ret = android_fork_execvp_ext(ARRAY_SIZE(f2fs_fsck_argv), f2fs_fsck_argv,
                                       &status, true, LOG_KLOG | LOG_FILE,
@@ -325,6 +356,11 @@ static int mount_with_alternatives(struct fstab *fstab, int start_idx, int *end_
             if (mounted) {
                 ERROR("%s(): skipping fstab dup mountpoint=%s rec[%d].fs_type=%s already mounted as %s.\n", __func__,
                      fstab->recs[i].mount_point, i, fstab->recs[i].fs_type, fstab->recs[*attempted_idx].fs_type);
+                continue;
+            }
+            if (fs_mgr_identify_fs(&fstab->recs[i]) == 0) {
+                ERROR("%s(): skipping unidentified mountpoint=%s rec[%d].fs_type=%s.\n", __func__,
+                     fstab->recs[i].mount_point, i, fstab->recs[i].fs_type);
                 continue;
             }
 
@@ -505,6 +541,7 @@ int fs_mgr_mount_all(struct fstab *fstab)
     int mret = -1;
     int mount_errno = 0;
     int attempted_idx = -1;
+    int retry = MAX_MOUNT_RETRIES;
 
     if (!fstab) {
         return -1;
@@ -535,7 +572,10 @@ int fs_mgr_mount_all(struct fstab *fstab)
         }
 
         if (fstab->recs[i].fs_mgr_flags & MF_WAIT) {
-            wait_for_file(fstab->recs[i].blk_device, WAIT_TIMEOUT);
+            mret = wait_for_file(fstab->recs[i].blk_device, WAIT_TIMEOUT);
+            if (mret)
+                ERROR("Gave up waiting for %s: %s\n",
+                      fstab->recs[i].blk_device, strerror(-mret));
         }
 
         if ((fstab->recs[i].fs_mgr_flags & MF_VERIFY) && device_is_secure()) {
@@ -572,6 +612,9 @@ int fs_mgr_mount_all(struct fstab *fstab)
             }
 
             /* Success!  Go get the next one */
+            INFO("Successfully mounted %s with file system type '%s'.\n",
+                 fstab->recs[attempted_idx].mount_point, fstab->recs[attempted_idx].fs_type);
+            retry = MAX_MOUNT_RETRIES;
             continue;
         }
 
@@ -612,20 +655,38 @@ int fs_mgr_mount_all(struct fstab *fstab)
                       fstab->recs[attempted_idx].fs_type);
                 encryptable = FS_MGR_MNTALL_DEV_NEEDS_RECOVERY;
                 continue;
-            } else {
+            } else if (fs_mgr_is_partition_encrypted(&fstab->recs[top_idx])) {
                 /* Need to mount a tmpfs at this mountpoint for now, and set
                  * properties that vold will query later for decrypting
                  */
-                ERROR("%s(): possibly an encryptable blkdev %s for mount %s type %s )\n", __func__,
+                ERROR("%s(): encrypted blkdev %s for mount %s type %s )\n", __func__,
                       fstab->recs[attempted_idx].blk_device, fstab->recs[attempted_idx].mount_point,
                       fstab->recs[attempted_idx].fs_type);
                 if (fs_mgr_do_tmpfs_mount(fstab->recs[attempted_idx].mount_point) < 0) {
                     ++error_count;
                     continue;
                 }
+            } else {
+                if (--retry > 0) {
+                    ERROR("Failed to mount %s; retrying...\n",
+                            fstab->recs[attempted_idx].mount_point);
+                    i = top_idx - 1;
+                    continue;
+                }
+                ERROR("Failed to mount an encryptable partition on"
+                       "%s at %s options: %s error: %s. Suggest recovery...\n",
+                       fstab->recs[attempted_idx].blk_device, fstab->recs[attempted_idx].mount_point,
+                       fstab->recs[attempted_idx].fs_options, strerror(mount_errno));
+                encryptable = FS_MGR_MNTALL_DEV_NEEDS_RECOVERY;
+                continue;
             }
             encryptable = FS_MGR_MNTALL_DEV_MIGHT_BE_ENCRYPTED;
         } else {
+            if (--retry > 0) {
+                ERROR("Failed to mount %s; retrying...\n", fstab->recs[attempted_idx].mount_point);
+                i = top_idx - 1;
+                continue;
+            }
             ERROR("Failed to mount an un-encryptable or wiped partition on"
                    "%s at %s options: %s error: %s\n",
                    fstab->recs[attempted_idx].blk_device, fstab->recs[attempted_idx].mount_point,
@@ -814,6 +875,9 @@ int fs_mgr_swapon_all(struct fstab *fstab)
         }
 
         /* Initialize the swap area */
+        if (setexeccon(MKSWAP_SECURITY_CONTEXT)) {
+            ERROR("Failed to set security context for mkswap\n");
+        }
         mkswap_argv[1] = fstab->recs[i].blk_device;
         err = android_fork_execvp_ext(ARRAY_SIZE(mkswap_argv), mkswap_argv,
                                       &status, true, LOG_KLOG, false, NULL);
@@ -821,6 +885,9 @@ int fs_mgr_swapon_all(struct fstab *fstab)
             ERROR("mkswap failed for %s\n", fstab->recs[i].blk_device);
             ret = -1;
             continue;
+        }
+        if (setexeccon(NULL)) {
+            ERROR("Failed to restore security context\n");
         }
 
         /* If -1, then no priority was specified in fstab, so don't set

@@ -88,7 +88,23 @@ enum {
     // Notify on autofocus start and stop. This is useful in continuous
     // autofocus - FOCUS_MODE_CONTINUOUS_VIDEO and FOCUS_MODE_CONTINUOUS_PICTURE.
     CAMERA_MSG_FOCUS_MOVE = 0x0800,       // notifyCallback
+    CAMERA_MSG_STATS_DATA = 0x1000,
+    CAMERA_MSG_META_DATA = 0x2000,
+
+    // BEGIN Motorola, w4779c, 2012-02-17, IKHSS6-8697
+    // Define Motorola-specific camera interface. It is Motorola-specific msg
+    // to pass quality related information from HAL back to Camera app.
+    CAMERA_MSG_ENV_DETECT = 0x8000,
+    // END IKHSS6-8697
+
     CAMERA_MSG_ALL_MSGS = 0xFFFF
+};
+
+/** meta data type in CameraMetaDataCallback */
+enum {
+    CAMERA_META_DATA_ASD = 0x001,    //ASD data
+    CAMERA_META_DATA_FD = 0x002,     //FD/FP data
+    CAMERA_META_DATA_HDR = 0x003,    //Auto HDR data
 };
 
 /** cmdType in sendCommand functions */
@@ -189,7 +205,22 @@ enum {
      * IMPLEMENTATION_DEFINED, then HALv3 devices will use gralloc usage flags
      * of SW_READ_OFTEN.
      */
-    CAMERA_CMD_SET_VIDEO_FORMAT = 11
+    CAMERA_CMD_SET_VIDEO_FORMAT = 11,
+
+    /**
+     * Commands to enable/disable preview histogram
+     *
+     * Based on user's input to enable/disable histogram from the camera
+     * UI, send the appropriate command to the HAL to turn on/off the histogram
+     * stats and start sending the data to the application.
+     */
+    CAMERA_CMD_HISTOGRAM_ON     = 12,
+    CAMERA_CMD_HISTOGRAM_OFF     = 13,
+    CAMERA_CMD_HISTOGRAM_SEND_DATA  = 14,
+    CAMERA_CMD_LONGSHOT_ON = 15,
+    CAMERA_CMD_LONGSHOT_OFF = 16,
+    CAMERA_CMD_METADATA_ON = 100,
+    CAMERA_CMD_METADATA_OFF = 101,
 };
 
 /** camera fatal errors */
@@ -276,7 +307,30 @@ typedef struct camera_face {
      */
     int32_t mouth[2];
 
+    int32_t smile_degree;
+    int32_t smile_score;
+    int32_t blink_detected;
+    int32_t face_recognised;
+    int32_t gaze_angle;
+    int32_t updown_dir;
+    int32_t leftright_dir;
+    int32_t roll_dir;
+    int32_t left_right_gaze;
+    int32_t top_bottom_gaze;
+    int32_t leye_blink;
+    int32_t reye_blink;
+
 } camera_face_t;
+
+/**
+ * The information of a data type received in a camera frame.
+ */
+typedef enum {
+    /** Data buffer */
+    CAMERA_FRAME_DATA_BUF = 0x000,
+    /** File descriptor */
+    CAMERA_FRAME_DATA_FD = 0x100
+} camera_frame_data_type_t;
 
 /**
  * The metadata of the frame data.

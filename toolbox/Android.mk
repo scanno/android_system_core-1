@@ -60,8 +60,18 @@ OUR_TOOLS := \
     uptime \
     watchprops \
 
-ALL_TOOLS = $(BSD_TOOLS) $(OUR_TOOLS)
+# Motorola - BEGIN - IKAPP-606 - wqnt78 - 3/10/2010 - apython enabler
 
+# Note: sendevent2 is in toolbox instead of motobox to avoid GPL issues
+
+OUR_TOOLS += sendevent2
+
+# Motorola - END - IKAPP-606 - wqnt78 - 3/10/2010 - apython enabler
+
+# Motorola, rknize2, 2013-Apr-16, IKJBXLINE-3829
+OUR_TOOLS += setfattr
+
+ALL_TOOLS = $(BSD_TOOLS) $(OUR_TOOLS)
 LOCAL_SRC_FILES := \
     toolbox.c \
     $(patsubst %,%.c,$(OUR_TOOLS)) \
@@ -73,6 +83,18 @@ LOCAL_SHARED_LIBRARIES := \
     libselinux \
 
 LOCAL_WHOLE_STATIC_LIBRARIES := $(patsubst %,libtoolbox_%,$(BSD_TOOLS))
+
+#BEGIN Motorola, xdkg47, 11-05-2012, IKMAINJB-6081/support property blacklist for Sprint TV
+ifeq ($(PRODUCT_HAVE_HTTP_RTSP_PROXY), true)
+LOCAL_CFLAGS += -DENABLE_BLACKLIST
+endif
+#END IKMAINJB-6081
+
+#BEGIN Motorola, xdkg47, 11-05-2012, IKMAINJB-6081/support property blacklist for Sprint TV
+ifeq ($(PRODUCT_HAVE_HTTP_RTSP_PROXY), true)
+LOCAL_CFLAGS += -DENABLE_BLACKLIST
+endif
+#END IKMAINJB-6081
 
 LOCAL_MODULE := toolbox
 

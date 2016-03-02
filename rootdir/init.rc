@@ -1,3 +1,6 @@
+# Copyright (c) 2013, The Linux Foundation. All rights reserved.
+# Not a Contribution.
+#
 # Copyright (C) 2012 The Android Open Source Project
 #
 # IMPORTANT: Do not create world writable files or directories.
@@ -34,6 +37,7 @@ on init
     # Create cgroup mount point for cpu accounting
     mkdir /acct
     mount cgroup none /acct cpuacct
+    chown system system /acct
     mkdir /acct/uid
 
     # Create cgroup mount point for memory
@@ -305,6 +309,22 @@ on post-fs-data
     # Avoid predictable entropy pool. Carry over entropy from previous boot.
     copy /data/system/entropy.dat /dev/urandom
 
+    # Create panic dump dir.
+    mkdir /data/dontpanic 0750 root log
+
+    # Collect apanic data, and apanic_annotate would free resources later
+    copy /proc/apanic_console /data/dontpanic/apanic_console
+    chown root log /data/dontpanic/apanic_console
+    chmod 0640 /data/dontpanic/apanic_console
+
+    copy /proc/apanic_threads /data/dontpanic/apanic_threads
+    chown root log /data/dontpanic/apanic_threads
+    chmod 0640 /data/dontpanic/apanic_threads
+
+    copy /proc/apanic_app_threads /data/dontpanic/apanic_app_threads
+    chown root log /data/dontpanic/apanic_app_threads
+    chmod 0640 /data/dontpanic/apanic_app_threads
+
     # create basic filesystem structure
     mkdir /data/misc 01771 system misc
     mkdir /data/misc/adb 02750 system shell
@@ -442,6 +462,7 @@ on boot
     chmod 0660 /sys/power/wake_lock
     chmod 0660 /sys/power/wake_unlock
 
+    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor interactive
     chown system system /sys/devices/system/cpu/cpufreq/interactive/timer_rate
     chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/timer_rate
     chown system system /sys/devices/system/cpu/cpufreq/interactive/timer_slack
@@ -465,10 +486,14 @@ on boot
     chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration
     chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
     chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/target_load
+    chmod 0660 /sys/devices/system/cpu/cpufreq/interactive/target_load
 
     # Assume SMP uses shared cpufreq policy for all CPUs
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
     chmod 0660 /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
+    chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
+    chmod 0660 /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
 
     chown system system /sys/class/timed_output/vibrator/enable
     chown system system /sys/class/leds/keyboard-backlight/brightness
@@ -642,25 +667,30 @@ service ril-daemon /system/bin/rild
     socket rild stream 660 root radio
     socket sap_uim_socket1 stream 660 bluetooth bluetooth
     socket rild-debug stream 660 radio system
+    socket cutback stream 660 media radio
     user root
-    group radio cache inet misc audio log
+    group radio cache inet misc audio log qcom_diag net_raw diag wifi compass
 
 service surfaceflinger /system/bin/surfaceflinger
     class core
     user system
     group graphics drmrpc
+    # allow the minimum realtime scheduler priority: RLIMIT_RTPRIO(14)=1
+    rlimit 14 1 1
     onrestart restart zygote
-    writepid /dev/cpuset/system-background/tasks
+    onrestart setprop sys.sf.restart 1
 
 service drm /system/bin/drmserver
     class main
     user drm
-    group drm system inet drmrpc
+    group drm inet drmrpc mot_drm mot_tpapi mot_secclkd
 
 service media /system/bin/mediaserver
     class main
     user media
-    group audio camera inet net_bt net_bt_admin net_bw_acct drmrpc mediadrm
+    group audio camera inet net_bt net_bt_admin net_bw_acct drmrpc mediadrm qcom_diag mot_drm mot_tpapi mot_secclkd power
+    # allow the minimum realtime scheduler priority: RLIMIT_RTPRIO(14)=1
+    rlimit 14 4 4
     ioprio rt 4
 
 # One shot invocation to deal with encrypted volume.
@@ -716,7 +746,7 @@ service mtpd /system/bin/mtpd
 service keystore /system/bin/keystore /data/misc/keystore
     class main
     user keystore
-    group keystore drmrpc
+    group keystore drmrpc mot_tpapi
 
 service dumpstate /system/bin/dumpstate -s
     class main
@@ -745,6 +775,7 @@ service pre-recovery /system/bin/uncrypt --reboot
 service perfprofd /system/xbin/perfprofd
     class late_start
     user root
+    disabled
     oneshot
     writepid /dev/cpuset/system-background/tasks
 

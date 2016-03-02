@@ -12,6 +12,25 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * This file was modified by Dolby Laboratories, Inc. The portions of the
+ * code that are surrounded by "DOLBY..." are copyrighted and
+ * licensed separately, as follows:
+ *
+ *  (C) 2011-2012 Dolby Laboratories, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
  */
 
 #include <stdio.h>
@@ -39,6 +58,7 @@
 #include <sys/un.h>
 #include <sys/select.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <private/android_filesystem_config.h>
@@ -58,6 +78,14 @@
 #define PERSISTENT_PROPERTY_DIR  "/data/property"
 #define FSTAB_PREFIX "/fstab."
 #define RECOVERY_MOUNT_POINT "/recovery"
+
+/* IKXREL3KK-3759 are002: define where we get overlay properties.
+ * question whether this should really be defined in all the same
+ * places that PROP_PATH_SYSTEM_BUILD is defined, or if we should
+ * just do it here. (there are many places that the PROP_PATH_SYSTEM_BUILD
+ * is defined).
+ */
+#define	PROP_PATH_OVERLAY_BUILD		"/system/overlay.prop"
 
 static int persistent_properties_loaded = 0;
 static bool property_area_initialized = false;
@@ -434,14 +462,15 @@ static void load_properties_from_file(const char* filename, const char* filter) 
 }
 
 static void load_persistent_properties() {
-    persistent_properties_loaded = 1;
-
     std::unique_ptr<DIR, int(*)(DIR*)> dir(opendir(PERSISTENT_PROPERTY_DIR), closedir);
     if (!dir) {
         ERROR("Unable to open persistent property directory \"%s\": %s\n",
               PERSISTENT_PROPERTY_DIR, strerror(errno));
         return;
     }
+
+    /* Set the flag only after PERSISTENT_PROPERTY_DIR has been mounted*/
+    persistent_properties_loaded = 1;
 
     struct dirent* entry;
     while ((entry = readdir(dir.get())) != NULL) {
@@ -509,13 +538,45 @@ static void load_override_properties() {
     }
 }
 
+/* BEGIN IKJB42MAIN-6952, 03/13/2013, w60013, rename persist.sys.usb.config */
+void update_persistent_usb_property(void)
+{
+	char currPath[PATH_MAX];
+	char newPath[PATH_MAX];
+
+	snprintf(currPath, sizeof(currPath), "%s/persist.sys.usb.config",
+				PERSISTENT_PROPERTY_DIR);
+	snprintf(newPath, sizeof(newPath), "%s/persist.mot.usb.config",
+				PERSISTENT_PROPERTY_DIR);
+	if (rename(currPath, newPath)) {
+		ERROR("Unable to rename persistent prop file %s\n", currPath);
+	}
+}
+/* END IKJB42MAIN-6952 */
+
 /* When booting an encrypted system, /data is not mounted when the
  * property service is started, so any properties stored there are
  * not loaded.  Vold triggers init to load these properties once it
  * has mounted /data.
  */
 void load_persist_props(void) {
+    /* BEGIN Motorola Hong-Mei Li 2012-09-10, IKJBREL1-5477 */
+    /* To load all default properties for encrypted system. This is mandatory
+     * for re-launch the main class service to be triggered on property, and
+     * that property has no backup on /data (user never changes it at runtime).
+     * Also, we reset persistent_properties_loaded flag to avoid persist props
+     * to be overwrite by default values.
+     */
+    persistent_properties_loaded = 0;
+    load_properties_from_file(PROP_PATH_OVERLAY_BUILD, NULL);	/* IKXREL3KK-3759 are002 */
+    load_properties_from_file(PROP_PATH_SYSTEM_BUILD, NULL);
+    /* END Motorola Hong-Mei Li 2012-09-10, IKJBREL1-5477 */
+
     load_override_properties();
+
+    /* IKVPREL1L-4680 - update usb properties after decryption */
+    update_persistent_usb_property();
+
     /* Read persistent properties after all default values have been loaded. */
     load_persistent_properties();
 }

@@ -30,6 +30,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -114,36 +115,106 @@ void service::NotifyStateChange(const char* new_state) {
     property_set(prop_name, new_state);
 }
 
-/* add_environment - add "key=value" to the current environment */
-int add_environment(const char *key, const char *val)
+static const char *expand_environment(const char *val)
 {
-    size_t n;
-    size_t key_len = strlen(key);
+    int n;
+    const char *prev_pos = NULL, *copy_pos;
+    size_t len, prev_len = 0, copy_len;
+    char *expanded;
 
-    /* The last environment entry is reserved to terminate the list */
-    for (n = 0; n < (ARRAY_SIZE(ENV) - 1); n++) {
+    /* Basic expansion of environment variable; for now
+       we only assume 1 expansion at the start of val
+       and that it is marked as ${var} */
+    if (!val) {
+        return NULL;
+    }
 
-        /* Delete any existing entry for this key */
-        if (ENV[n] != NULL) {
-            size_t entry_key_len = strcspn(ENV[n], "=");
-            if ((entry_key_len == key_len) && (strncmp(ENV[n], key, entry_key_len) == 0)) {
-                free((char*)ENV[n]);
-                ENV[n] = NULL;
+    if ((val[0] == '$') && (val[1] == '{')) {
+        for (n = 0; n < 31; n++) {
+            if (ENV[n]) {
+                len = strcspn(ENV[n], "=");
+                if (!strncmp(&val[2], ENV[n], len)
+                      && (val[2 + len] == '}')) {
+                    /* Matched existing env */
+                    prev_pos = &ENV[n][len + 1];
+                    prev_len = strlen(prev_pos);
+                    break;
+                }
             }
         }
+        copy_pos = strchr(val, '}');
+        if (copy_pos) {
+            copy_pos++;
+            copy_len = strlen(copy_pos);
+        } else {
+            copy_pos = val;
+            copy_len = strlen(val);
+        }
+    } else {
+        copy_pos = val;
+        copy_len = strlen(val);
+    }
 
-        /* Add entry if a free slot is available */
-        if (ENV[n] == NULL) {
-            char* entry;
-            asprintf(&entry, "%s=%s", key, val);
-            ENV[n] = entry;
-            return 0;
+    len = prev_len + copy_len + 1;
+    expanded = (char *) malloc(len);
+    if (expanded) {
+        if (prev_pos) {
+            snprintf(expanded, len, "%s%s", prev_pos, copy_pos);
+        } else {
+            snprintf(expanded, len, "%s", copy_pos);
         }
     }
 
-    ERROR("No env. room to store: '%s':'%s'\n", key, val);
+    /* caller free */
+    return expanded;
+}
 
-    return -1;
+/* add_environment - add "key=value" to the current environment */
+int add_environment(const char *key, const char *val)
+{
+    int n;
+    const char *expanded;
+
+    expanded = expand_environment(val);
+    if (!expanded) {
+        goto failed;
+    }
+
+    for (n = 0; n < 31; n++) {
+        if (!ENV[n]) {
+            size_t len = strlen(key) + strlen(expanded) + 2;
+            char *entry = (char *) malloc(len);
+            if (!entry) {
+                goto failed_cleanup;
+            }
+            snprintf(entry, len, "%s=%s", key, expanded);
+            free((char *)expanded);
+            ENV[n] = entry;
+            return 0;
+        } else {
+            char *entry;
+            size_t len = strlen(key);
+            if(!strncmp(ENV[n], key, len) && ENV[n][len] == '=') {
+                len = len + strlen(expanded) + 2;
+                entry = (char *) malloc(len);
+                if (!entry) {
+                    goto failed_cleanup;
+                }
+
+                free((char *)ENV[n]);
+                snprintf(entry, len, "%s=%s", key, expanded);
+                free((char *)expanded);
+                ENV[n] = entry;
+                return 0;
+            }
+        }
+    }
+
+failed_cleanup:
+    free((char *)expanded);
+failed:
+    ERROR("Fail to add env variable: %s. Not enough memory!", key);
+    return 1;
 }
 
 void zap_stdio(void)
@@ -263,6 +334,7 @@ void service_start(struct service *svc, const char *dynamic_args)
     if (pid == 0) {
         struct socketinfo *si;
         struct svcenvinfo *ei;
+        struct svcrlimitinfo *ri;
         char tmp[32];
         int fd, sz;
 
@@ -284,6 +356,13 @@ void service_start(struct service *svc, const char *dynamic_args)
                                   si->perm, si->uid, si->gid, si->socketcon ?: scon);
             if (s >= 0) {
                 publish_socket(si->name, s);
+            }
+        }
+
+        for (ri = svc->rlimits; ri; ri = ri->next) {
+            if (setrlimit(ri->resource, &ri->limit)) {
+                ERROR("Failed to set pid %d rlimit %d %lu %lu\n",
+                      getpid(), ri->resource, ri->limit.rlim_cur, ri->limit.rlim_max);
             }
         }
 
@@ -632,7 +711,7 @@ static int wait_for_coldboot_done_action(int nargs, char **args) {
     // Any longer than 1s is an unreasonable length of time to delay booting.
     // If you're hitting this timeout, check that you didn't make your
     // sepolicy regular expressions too expensive (http://b/19899875).
-    if (wait_for_file(COLDBOOT_DONE, 1)) {
+    if (wait_for_file(COLDBOOT_DONE, COMMAND_RETRY_TIMEOUT * 10)) {
         ERROR("Timed out waiting for %s\n", COLDBOOT_DONE);
     }
 
@@ -792,6 +871,25 @@ static void import_kernel_nv(char *name, bool for_emulator)
             property_set(prop, value);
     }
 }
+/*
+ * Adding ro.bootreason, which be used to indicate kpanic/wdt boot status.
+ * When ro.boot.last_powerup_reason is set, it denotes this is a 2nd reboot
+ * after kpanic/wdt, we set ro.bootreason as coldboot to copy logs.
+ * Otherwise,we would set ro.bootreason the same as ro.boot.bootreason.
+ */
+static void export_kernel_boot_reason(void)
+{
+    char tmp[PROP_VALUE_MAX];
+    int ret;
+    ret = property_get("ro.boot.last_powerup_reason", tmp);
+    if (ret) {
+        property_set("ro.bootreason", "coldboot");
+    } else {
+        ret = property_get("ro.boot.bootreason", tmp);
+        if (ret)
+            property_set("ro.bootreason", tmp);
+    }
+}
 
 static void export_kernel_boot_props() {
     struct {
@@ -800,17 +898,52 @@ static void export_kernel_boot_props() {
         const char *default_value;
     } prop_map[] = {
         { "ro.boot.serialno",   "ro.serialno",   "", },
+        { "ro.boot.fsg-id", "ro.fsg-id", NULL, },
         { "ro.boot.mode",       "ro.bootmode",   "unknown", },
         { "ro.boot.baseband",   "ro.baseband",   "unknown", },
         { "ro.boot.bootloader", "ro.bootloader", "unknown", },
         { "ro.boot.hardware",   "ro.hardware",   "unknown", },
-        { "ro.boot.revision",   "ro.revision",   "0", },
+        { "ro.boot.radio", "ro.hw.radio", NULL, },
+        { "ro.boot.carrier", "ro.carrier", NULL, },
+        { "ro.boot.device", "ro.hw.device", NULL, },
+        { "ro.boot.hwrev", "ro.hw.hwrev", NULL, },
+        { "ro.boot.radio", "ro.hw.radio", NULL, },
+        { "ro.boot.nav_keys", "ro.hw.nav_keys", NULL, },
+        { "ro.boot.lcd_density", "ro.sf.lcd_density", NULL, },
+        { "ro.boot.modelno", "ro.product.display", NULL, },
+#ifdef LOAD_INIT_RC_FROM_PROP
+        { "ro.boot.init_rc", "ro.init_rc", "/init.rc", },
+#endif
     };
     for (size_t i = 0; i < ARRAY_SIZE(prop_map); i++) {
         char value[PROP_VALUE_MAX];
         int rc = property_get(prop_map[i].src_prop, value);
-        property_set(prop_map[i].dst_prop, (rc > 0) ? value : prop_map[i].default_value);
+        if (rc > 0)
+            property_set(prop_map[i].dst_prop, value);
+        else if (prop_map[i].default_value != NULL)
+            property_set(prop_map[i].dst_prop, prop_map[i].default_value);
     }
+
+    char tmp[PROP_VALUE_MAX];
+    unsigned revision = 0;
+    int ret = property_get("ro.boot.revision", tmp);
+    if (!ret)
+	ret = property_get("ro.hw.hwrev", tmp);
+    if (ret > 0) {
+	if (strstr(tmp, "0x")) {
+            revision = strtoul(tmp+2, 0, 16);
+	    snprintf(tmp, PROP_VALUE_MAX, "%x", revision);
+        }
+        switch(tmp[0]){
+            case '1': tmp[0] = 's'; break;
+            case '2': tmp[0] = 'm'; break;
+            case '8': tmp[0] = 'p'; break;
+            case '9': tmp[0] = 'd'; break;
+        }
+        property_set("ro.revision", tmp);
+    }
+
+    export_kernel_boot_reason();
 }
 
 static void process_kernel_dt(void)
@@ -1077,7 +1210,39 @@ int main(int argc, char** argv) {
     property_load_boot_defaults();
     start_property_service();
 
+#ifdef LOAD_INIT_RC_FROM_PROP
+    char init_rc_name[PROP_VALUE_MAX];
+    property_get("ro.init_rc", init_rc_name);
+    init_parse_config_file(init_rc_name);
+#else
     init_parse_config_file("/init.rc");
+#endif
+
+    /* BEGIN IKKRNBSP-1013, 3/13/2012, jcarlyle, Add more init.rc layers. */
+    char path[PROP_VALUE_MAX*2], bootprop[PROP_VALUE_MAX];
+
+    /* If androidboot.baseband is set, check for a baseband-specific
+     * initialization file and read if present. */
+    if (property_get("ro.baseband", bootprop) > 0) {
+        snprintf(path, sizeof(path), "/init.%s.rc", bootprop);
+        if (access(path, R_OK) == 0) {
+            INFO("Reading baseband [%s] specific config file", bootprop);
+            init_parse_config_file(path);
+        }
+    }
+
+    /* If androidboot.carrier is set or if ro.carrier is
+     * defined in the default build properties, check for a carrier-specific
+     * initialization and read if present. */
+    if (property_get("ro.carrier", bootprop) > 0) {
+        snprintf(path, sizeof(path), "/init.%s.rc", bootprop);
+        if (access(path, R_OK) == 0) {
+            INFO("Reading bootprop [%s] specific config file", bootprop);
+            init_parse_config_file(path);
+        }
+    }
+
+    /* END IKKRNBSP-1013, 3/13/2012, jcarlyle, Add more init.rc layers. */
 
     action_for_each_trigger("early-init", action_add_queue_tail);
 
@@ -1096,11 +1261,23 @@ int main(int argc, char** argv) {
     queue_builtin_action(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
 
     // Don't mount filesystems or start core system services in charger mode.
+    bool is_ffbm = false;
+    bool is_charger = false;
+#ifndef MOTO_NEW_CHARGE_ONLY_MODE
     char bootmode[PROP_VALUE_MAX];
-    if (property_get("ro.bootmode", bootmode) > 0 && strcmp(bootmode, "charger") == 0) {
+    if (property_get("ro.bootmode", bootmode) > 0) {
+        is_ffbm = strcmp(bootmode, "ffbm") == 0;
+        is_charger = !is_ffbm && ( strcmp(bootmode, "charger") == 0 || strcmp(bootmode, "mot-charger") == 0 );
+    }
+#endif
+ 
+    if (is_charger ) {
         action_for_each_trigger("charger", action_add_queue_tail);
     } else {
-        action_for_each_trigger("late-init", action_add_queue_tail);
+        if (is_ffbm)
+            action_for_each_trigger("ffbm", action_add_queue_tail);
+        else
+            action_for_each_trigger("late-init", action_add_queue_tail);
     }
 
     // Run all property triggers based on current state of the properties.

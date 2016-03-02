@@ -47,12 +47,15 @@
 #include "ueventd_parser.h"
 #include "util.h"
 #include "log.h"
+#include "property_service.h"
+#include <zlib.h>
 
 #define SYSFS_PREFIX    "/sys"
 static const char *firmware_dirs[] = { "/etc/firmware",
                                        "/vendor/firmware",
                                        "/firmware/image" };
 
+static char *bootdevice;
 extern struct selabel_handle *sehandle;
 
 static int device_fd = -1;
@@ -105,12 +108,12 @@ int add_dev_perms(const char *name, const char *attr,
 
     node->dp.name = strdup(name);
     if (!node->dp.name)
-        return -ENOMEM;
+        goto node_free_out;
 
     if (attr) {
         node->dp.attr = strdup(attr);
         if (!node->dp.attr)
-            return -ENOMEM;
+            goto name_free_out;
     }
 
     node->dp.perm = perm;
@@ -125,6 +128,12 @@ int add_dev_perms(const char *name, const char *attr,
         list_add_tail(&dev_perms, &node->plist);
 
     return 0;
+
+name_free_out:
+    free(node->dp.name);
+node_free_out:
+    free(node);
+    return -ENOMEM;
 }
 
 void fixup_sys_perms(const char *upath)
@@ -269,15 +278,25 @@ static void add_platform_device(const char *path)
     struct platform_node *bus;
     const char *name = path;
 
+#ifdef _PLATFORM_BASE
+    if (!strncmp(path, _PLATFORM_BASE, strlen(_PLATFORM_BASE)))
+        name += strlen(_PLATFORM_BASE);
+    else
+        return;
+#else
     if (!strncmp(path, "/devices/", 9)) {
         name += 9;
         if (!strncmp(name, "platform/", 9))
             name += 9;
     }
+#endif
 
     INFO("adding platform device %s (%s)\n", name, path);
 
     bus = (platform_node*) calloc(1, sizeof(struct platform_node));
+    if (!bus)
+        return;
+
     bus->path = strdup(path);
     bus->path_len = path_len;
     bus->name = bus->path + (name - path);
@@ -409,6 +428,41 @@ static void parse_event(const char *msg, struct uevent *uevent)
     }
 }
 
+static char **get_v4l_device_symlinks(struct uevent *uevent)
+{
+    char **links;
+    int fd = -1;
+    int nr;
+    char link_name_path[256];
+    char link_name[64];
+
+    if (strncmp(uevent->path, "/devices/virtual/video4linux/video", 34))
+        return NULL;
+
+    links = (char**) malloc(sizeof(char *) * 2);
+    if (!links)
+        return NULL;
+    memset(links, 0, sizeof(char *) * 2);
+
+    snprintf(link_name_path, sizeof(link_name_path), "%s%s%s",
+            SYSFS_PREFIX, uevent->path, "/link_name");
+    fd = open(link_name_path, O_RDONLY);
+    if (fd < 0)
+        goto err;
+    nr = read(fd, link_name, sizeof(link_name) - 1);
+    close(fd);
+    if (nr <= 0)
+        goto err;
+    link_name[nr] = '\0';
+    if (asprintf(&links[0], "/dev/video/%s", link_name) <= 0)
+        links[0] = NULL;
+
+    return links;
+err:
+    free(links);
+    return NULL;
+}
+
 static char **get_character_device_symlinks(struct uevent *uevent)
 {
     const char *parent;
@@ -430,6 +484,8 @@ static char **get_character_device_symlinks(struct uevent *uevent)
     /* skip "/devices/platform/<driver>" */
     parent = strchr(uevent->path + pdev->path_len, '/');
     if (!parent)
+        goto err;
+
         goto err;
 
     if (!strncmp(parent, "/usb", 4)) {
@@ -484,10 +540,10 @@ static char **get_block_device_symlinks(struct uevent *uevent)
         return NULL;
     }
 
-    char **links = (char**) malloc(sizeof(char *) * 4);
+    char **links = (char**) malloc(sizeof(char *) * 6);
     if (!links)
         return NULL;
-    memset(links, 0, sizeof(char *) * 4);
+    memset(links, 0, sizeof(char *) * 6);
 
     INFO("found %s device %s\n", type, device);
 
@@ -502,11 +558,21 @@ static char **get_block_device_symlinks(struct uevent *uevent)
             link_num++;
         else
             links[link_num] = NULL;
+        if (asprintf(&links[link_num], "/dev/block/bootdevice/by-name/%s", p) > 0)
+            link_num++;
+        else
+            links[link_num] = NULL;
+
         free(p);
     }
 
     if (uevent->partition_num >= 0) {
         if (asprintf(&links[link_num], "%s/by-num/p%d", link_path, uevent->partition_num) > 0)
+            link_num++;
+        else
+            links[link_num] = NULL;
+
+        if (asprintf(&links[link_num], "/dev/block/bootdevice/by-num/p%d", uevent->partition_num) > 0)
             link_num++;
         else
             links[link_num] = NULL;
@@ -517,6 +583,14 @@ static char **get_block_device_symlinks(struct uevent *uevent)
         link_num++;
     else
         links[link_num] = NULL;
+
+    if (!bootdevice) {
+        char property[PROP_VALUE_MAX];
+        if (property_get("ro.boot.bootdevice", property))
+            bootdevice = strdup(property);
+    }
+    if (bootdevice && !strcmp(device, bootdevice))
+        make_link_init(link_path, "/dev/block/bootdevice");
 
     return links;
 }
@@ -723,9 +797,32 @@ static void handle_generic_device_event(struct uevent *uevent)
          base = "/dev/log/";
          make_dir(base, 0755);
          name += 4;
+     } else if (!strncmp(uevent->subsystem, "dvb", 3)) {
+         /* This imitates the file system that would be created
+          * if we were using devfs instead to preserve backward compatibility
+          * for users of dvb devices
+          */
+         int adapter_id;
+         char dev_name[20] = {0};
+
+         sscanf(name, "dvb%d.%s", &adapter_id, dev_name);
+
+         /* build dvb directory */
+         base = "/dev/dvb";
+         mkdir(base, 0755);
+
+         /* build adapter directory */
+         snprintf(devpath, sizeof(devpath), "/dev/dvb/adapter%d", adapter_id);
+         mkdir(devpath, 0755);
+
+         /* build actual device directory */
+         snprintf(devpath, sizeof(devpath), "/dev/dvb/adapter%d/%s",
+                  adapter_id, dev_name);
      } else
          base = "/dev/";
      links = get_character_device_symlinks(uevent);
+     if (!links)
+         links = get_v4l_device_symlinks(uevent);
 
      if (!devpath[0])
          snprintf(devpath, sizeof(devpath), "%s%s", base, name);
@@ -748,23 +845,20 @@ static void handle_device_event(struct uevent *uevent)
     }
 }
 
-static int load_firmware(int fw_fd, int loading_fd, int data_fd)
+static int load_firmware(int fw_fd, gzFile gz_fd, int loading_fd, int data_fd)
 {
-    struct stat st;
-    long len_to_copy;
     int ret = 0;
-
-    if(fstat(fw_fd, &st) < 0)
-        return -1;
-    len_to_copy = st.st_size;
 
     write(loading_fd, "1", 1);  /* start transfer */
 
-    while (len_to_copy > 0) {
+    while (1) {
         char buf[PAGE_SIZE];
         ssize_t nr;
 
-        nr = read(fw_fd, buf, sizeof(buf));
+        if (gz_fd != Z_NULL)
+            nr = gzread(gz_fd, buf, sizeof(buf));
+        else
+            nr = read(fw_fd, buf, sizeof(buf));
         if(!nr)
             break;
         if(nr < 0) {
@@ -772,7 +866,6 @@ static int load_firmware(int fw_fd, int loading_fd, int data_fd)
             break;
         }
 
-        len_to_copy -= nr;
         while (nr > 0) {
             ssize_t nw = 0;
 
@@ -788,8 +881,10 @@ static int load_firmware(int fw_fd, int loading_fd, int data_fd)
 out:
     if(!ret)
         write(loading_fd, "0", 1);  /* successful end of transfer */
-    else
+    else {
+        ERROR("%s: aborted transfer\n", __func__);
         write(loading_fd, "-1", 2); /* abort transfer */
+    }
 
     return ret;
 }
@@ -799,12 +894,96 @@ static int is_booting(void)
     return access("/dev/.booting", F_OK) == 0;
 }
 
+/*
+   BEGIN IKVOICE-4341
+   Special firmware look-up function intended for AoV feature with Cirrus XMCS codec.
+   The foloder is intended to be used for speech model downloading and firmware upgrade.
+   Folder is specifically protected for AoV use via SELinux policy.
+
+   The function returns the following values:
+   -1 - Firmware loading was either success or failure. No need to look for further folders.
+    0 - Firmware was not loaded. Further folders need to be looked up.
+*/
+#ifdef MOTO_AOV_WITH_XMCS
+static int is_hard_link(const char *path)
+{
+    int rv = 1;
+    struct stat sb;
+
+    if(stat(path, &sb) == 0) {
+        if((S_ISDIR(sb.st_mode)) || (sb.st_nlink == 1))
+            rv = 0;
+        else
+            ERROR("Invalid hard link (%s), nlink=%ld ignoring!\n", path,
+                  (long)sb.st_nlink);
+    } else if (errno == ENOENT)
+        rv = 0;
+    return(rv);
+}
+
+static int load_from_extended(const char *firmware, int loading_fd, int data_fd)
+{
+    int l, fw_fd;
+    char *file = NULL;
+    int ret = 0;
+
+    /* look for naming convention for aov firmware */
+    if (strstr(firmware, "-aov-") == NULL) {
+        return 0;
+    }
+
+    l = asprintf(&file, "/data/adspd/%s", firmware);
+    if (l == -1)
+        return 0;
+
+    if (is_hard_link(file)) {
+        goto out_extended;
+    }
+
+    /* Do not consider the case /data folder is still encrypted.
+       It is assumed adspd is started only after data partition is decrypted
+       so firmware request for XMCS would happen on decripted fs */
+    fw_fd = open(file, O_RDONLY | O_NOFOLLOW);
+    if(fw_fd < 0) {
+        goto out_extended;
+    }
+
+    if (load_firmware(fw_fd, Z_NULL, loading_fd, data_fd) != 0) {
+        ERROR("firmware: could not load '%s'\n", firmware);
+    }
+    close(fw_fd);
+    ret = -1;
+
+out_extended:
+    free(file);
+    return ret;
+}
+#endif
+/* END IKVOICE-4341 */
+
+gzFile fw_gzopen(const char *fname, const char *mode)
+{
+    char *gzfile = NULL;
+    int l;
+    gzFile gz_fd = Z_NULL;
+
+    l = asprintf(&gzfile, "%s.gz", fname);
+    if (l == -1)
+        goto out;
+
+    gz_fd = gzopen(gzfile, mode);
+    free(gzfile);
+out:
+    return gz_fd;
+}
+
 static void process_firmware_event(struct uevent *uevent)
 {
     char *root, *loading, *data;
     int l, loading_fd, data_fd, fw_fd;
     size_t i;
     int booting = is_booting();
+    gzFile gz_fd = Z_NULL;
 
     INFO("firmware: loading '%s' for '%s'\n",
          uevent->firmware, uevent->path);
@@ -829,6 +1008,14 @@ static void process_firmware_event(struct uevent *uevent)
     if(data_fd < 0)
         goto loading_close_out;
 
+/* BEGIN IKVOICE-4341 */
+#ifdef MOTO_AOV_WITH_XMCS
+    if (load_from_extended(uevent->firmware, loading_fd, data_fd) < 0) {
+        goto data_close_out;
+    }
+#endif
+/* END IKVOICE-4341 */
+
 try_loading_again:
     for (i = 0; i < ARRAY_SIZE(firmware_dirs); i++) {
         char *file = NULL;
@@ -836,16 +1023,18 @@ try_loading_again:
         if (l == -1)
             goto data_free_out;
         fw_fd = open(file, O_RDONLY|O_CLOEXEC);
+        if (fw_fd < 0)
+            gz_fd = fw_gzopen(file, "rb");
         free(file);
-        if (fw_fd >= 0) {
-            if(!load_firmware(fw_fd, loading_fd, data_fd))
+        if (fw_fd >= 0 || gz_fd != Z_NULL ) {
+            if(!load_firmware(fw_fd, gz_fd, loading_fd, data_fd))
                 INFO("firmware: copy success { '%s', '%s' }\n", root, uevent->firmware);
             else
                 INFO("firmware: copy failure { '%s', '%s' }\n", root, uevent->firmware);
             break;
         }
     }
-    if (fw_fd < 0) {
+    if (fw_fd < 0 && gz_fd == Z_NULL) {
         if (booting) {
             /* If we're not fully booted, we may be missing
              * filesystems needed for firmware, wait and retry.
@@ -859,7 +1048,10 @@ try_loading_again:
         goto data_close_out;
     }
 
-    close(fw_fd);
+    if (gz_fd != Z_NULL)
+        gzclose(gz_fd);
+    else
+        close(fw_fd);
 data_close_out:
     close(data_fd);
 loading_close_out:

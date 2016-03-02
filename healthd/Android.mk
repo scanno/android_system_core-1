@@ -25,6 +25,11 @@ LOCAL_UNSTRIPPED_PATH := $(TARGET_ROOT_OUT_SBIN_UNSTRIPPED)
 
 LOCAL_CFLAGS := -D__STDC_LIMIT_MACROS -Werror
 
+# MOT (IKXREL3KK-5478) - add capability to run root-detect on periodoc basis for verizon devices
+ifeq ($(TARGET_SUPPORTS_DAILY_ROOT_DETECT),true)
+LOCAL_CFLAGS += -DQE
+endif
+
 ifeq ($(strip $(BOARD_CHARGER_DISABLE_INIT_BLANK)),true)
 LOCAL_CFLAGS += -DCHARGER_DISABLE_INIT_BLANK
 endif
@@ -36,6 +41,11 @@ endif
 LOCAL_C_INCLUDES := bootable/recovery
 
 LOCAL_STATIC_LIBRARIES := libbatteryservice libbinder libminui libpng libz libutils libstdc++ libcutils liblog libm libc
+
+# MOT (IKHALFMWK-1422) - support app permission controll
+ifeq ($(ENABLE_LENOVO_SECUREIT),true)
+LOCAL_STATIC_LIBRARIES += libapppc
+endif
 
 ifeq ($(strip $(BOARD_CHARGER_ENABLE_SUSPEND)),true)
 LOCAL_STATIC_LIBRARIES += libsuspend

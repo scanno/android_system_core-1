@@ -105,9 +105,13 @@ int fs_mgr_is_file_encrypted(const struct fstab_rec *fstab);
 int fs_mgr_is_noemulatedsd(const struct fstab_rec *fstab);
 int fs_mgr_is_notrim(struct fstab_rec *fstab);
 int fs_mgr_is_formattable(struct fstab_rec *fstab);
+struct fstab_rec *fs_mgr_get_entry_for_mount_point_after(struct fstab_rec *start_rec,
+                                                         struct fstab *fstab, const char *path);
 int fs_mgr_swapon_all(struct fstab *fstab);
 
 int fs_mgr_do_format(struct fstab_rec *fstab);
+int fs_mgr_is_partition_encrypted(struct fstab_rec *fstab);
+int fs_mgr_identify_fs(struct fstab_rec *fstab);
 
 #ifdef __cplusplus
 }

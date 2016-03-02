@@ -85,8 +85,8 @@ static const struct fs_path_config android_dirs[] = {
     { 01771, AID_SYSTEM, AID_MISC,   0, "data/misc" },
     { 00770, AID_DHCP,   AID_DHCP,   0, "data/misc/dhcp" },
     { 00771, AID_SHARED_RELRO, AID_SHARED_RELRO, 0, "data/misc/shared_relro" },
-    { 00775, AID_MEDIA_RW, AID_MEDIA_RW, 0, "data/media" },
-    { 00775, AID_MEDIA_RW, AID_MEDIA_RW, 0, "data/media/Music" },
+    { 00775, AID_ROOT, AID_MEDIA_RW, 0, "data/media" },
+    { 00775, AID_ROOT, AID_MEDIA_RW, 0, "data/media/Music" },
     { 00771, AID_SYSTEM, AID_SYSTEM, 0, "data" },
     { 00750, AID_ROOT,   AID_SHELL,  0, "sbin" },
     { 00755, AID_ROOT,   AID_ROOT,   0, "system/addon.d" },
@@ -95,6 +95,10 @@ static const struct fs_path_config android_dirs[] = {
     { 00755, AID_ROOT,   AID_SHELL,  0, "system/xbin" },
     { 00755, AID_ROOT,   AID_ROOT,   0, "system/etc/ppp" },
     { 00755, AID_ROOT,   AID_SHELL,  0, "system/etc" },
+   /* the following two directory paths are INTENTIONALLY added
+    * to ensure parent folder and sub-folders get different permissions. */
+    { 00755, AID_ROOT,   AID_SYSTEM, 0, "system/multiconfig/ap/" },
+    { 00750, AID_ROOT,   AID_SYSTEM, 0, "system/multiconfig/ap" },
     { 00755, AID_ROOT,   AID_SHELL,  0, "vendor" },
     { 00777, AID_ROOT,   AID_ROOT,   0, "sdcard" },
     { 00755, AID_ROOT,   AID_ROOT,   0, 0 },
@@ -123,6 +127,13 @@ static const struct fs_path_config android_files[] = {
     { 00644, AID_MEDIA_RW,  AID_MEDIA_RW,  0, "data/media/*" },
     { 00644, AID_SYSTEM,    AID_SYSTEM,    0, "data/app-private/*" },
     { 00644, AID_APP,       AID_APP,       0, "data/data/*" },
+    { 00755, AID_ROOT,      AID_ROOT,      0, "init.class_main.sh" },
+    { 00500, AID_ROOT,      AID_SHELL,     0, "system/etc/install-recovery.sh" },
+    { 00750, AID_ROOT,      AID_ROOT,      0, "xbin/qe" },
+
+    /* the following file is INTENTIONALLY set-uid, and IS included
+     * in user builds. */
+    { 06750, AID_ROOT,      AID_DIAG,      0, "system/xbin/sudo" },
 
     /* the following five files are INTENTIONALLY set-uid, but they
      * are NOT included on user builds. */
@@ -131,6 +142,7 @@ static const struct fs_path_config android_files[] = {
     { 06755, AID_ROOT,      AID_ROOT,      0, "system/xbin/procrank" },
     { 06755, AID_ROOT,      AID_ROOT,      0, "system/xbin/procmem" },
     { 04770, AID_ROOT,      AID_RADIO,     0, "system/bin/pppd-ril" },
+    { 04750, AID_ROOT,      AID_SYSTEM,    0, "system/bin/perf-monitor" },
 
     /* the following files have enhanced capabilities and ARE included in user builds. */
     { 00750, AID_ROOT,      AID_SHELL,     (1ULL << CAP_SETUID) | (1ULL << CAP_SETGID), "system/bin/run-as" },
@@ -150,6 +162,7 @@ static const struct fs_path_config android_files[] = {
     { 00750, AID_ROOT,      AID_SHELL,     0, "init*" },
     { 00750, AID_ROOT,      AID_SHELL,     0, "sbin/fs_mgr" },
     { 00640, AID_ROOT,      AID_SHELL,     0, "fstab.*" },
+    { 00400, AID_ROOT,      AID_ROOT,      0, "module_hashes" },
     { 00644, AID_ROOT,      AID_ROOT,      0, 0 },
 };
 

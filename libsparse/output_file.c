@@ -33,6 +33,7 @@
 #include "output_file.h"
 #include "sparse_crc32.h"
 #include "sparse_format.h"
+#include "sparse_defs.h"
 
 #ifndef USE_MINGW
 #include <sys/mman.h>
@@ -63,16 +64,16 @@ struct output_file_ops {
 	int (*open)(struct output_file *, int fd);
 	int (*skip)(struct output_file *, int64_t);
 	int (*pad)(struct output_file *, int64_t);
-	int (*write)(struct output_file *, void *, int);
+	int (*write)(struct output_file *, void *, int64_t);
 	void (*close)(struct output_file *);
 };
 
 struct sparse_file_ops {
-	int (*write_data_chunk)(struct output_file *out, unsigned int len,
+	int (*write_data_chunk)(struct output_file *out, int64_t len,
 			void *data);
-	int (*write_fill_chunk)(struct output_file *out, unsigned int len,
+	int (*write_fill_chunk)(struct output_file *out, int64_t len,
 			uint32_t fill_val);
-	int (*write_skip_chunk)(struct output_file *out, int64_t len);
+	int (*write_skip_chunk)(struct output_file *out, int64_t len, bool last_block);
 	int (*write_end_chunk)(struct output_file *out);
 };
 
@@ -109,7 +110,7 @@ struct output_file_normal {
 struct output_file_callback {
 	struct output_file out;
 	void *priv;
-	int (*write)(void *priv, const void *buf, int len);
+	int (*write)(void *priv, const void *buf, int64_t len);
 };
 
 #define to_output_file_callback(_o) \
@@ -149,7 +150,7 @@ static int file_pad(struct output_file *out, int64_t len)
 	return 0;
 }
 
-static int file_write(struct output_file *out, void *data, int len)
+static int file_write(struct output_file *out, void *data, int64_t len)
 {
 	int ret;
 	struct output_file_normal *outn = to_output_file_normal(out);
@@ -232,7 +233,7 @@ static int gz_file_pad(struct output_file *out, int64_t len)
 	return 0;
 }
 
-static int gz_file_write(struct output_file *out, void *data, int len)
+static int gz_file_write(struct output_file *out, void *data, int64_t len)
 {
 	int ret;
 	struct output_file_gz *outgz = to_output_file_gz(out);
@@ -293,7 +294,7 @@ static int callback_file_pad(struct output_file *out __unused, int64_t len __unu
 	return -1;
 }
 
-static int callback_file_write(struct output_file *out, void *data, int len)
+static int callback_file_write(struct output_file *out, void *data, int64_t len)
 {
 	struct output_file_callback *outc = to_output_file_callback(out);
 
@@ -337,12 +338,12 @@ int read_all(int fd, void *buf, size_t len)
 	return 0;
 }
 
-static int write_sparse_skip_chunk(struct output_file *out, int64_t skip_len)
+static int write_sparse_skip_chunk(struct output_file *out, int64_t skip_len, bool last_block)
 {
 	chunk_header_t chunk_header;
 	int ret;
 
-	if (skip_len % out->block_size) {
+	if (!last_block && (skip_len % out->block_size)) {
 		error("don't care size %"PRIi64" is not a multiple of the block size %u",
 				skip_len, out->block_size);
 		return -1;
@@ -351,7 +352,10 @@ static int write_sparse_skip_chunk(struct output_file *out, int64_t skip_len)
 	/* We are skipping data, so emit a don't care chunk. */
 	chunk_header.chunk_type = CHUNK_TYPE_DONT_CARE;
 	chunk_header.reserved1 = 0;
-	chunk_header.chunk_sz = skip_len / out->block_size;
+	if (last_block)
+		chunk_header.chunk_sz = DIV_ROUND_UP(skip_len, out->block_size);
+	else
+		chunk_header.chunk_sz = skip_len / out->block_size;
 	chunk_header.total_sz = CHUNK_HEADER_LEN;
 	ret = out->ops->write(out, &chunk_header, sizeof(chunk_header));
 	if (ret < 0)
@@ -363,7 +367,7 @@ static int write_sparse_skip_chunk(struct output_file *out, int64_t skip_len)
 	return 0;
 }
 
-static int write_sparse_fill_chunk(struct output_file *out, unsigned int len,
+static int write_sparse_fill_chunk(struct output_file *out, int64_t len,
 		uint32_t fill_val)
 {
 	chunk_header_t chunk_header;
@@ -398,7 +402,7 @@ static int write_sparse_fill_chunk(struct output_file *out, unsigned int len,
 	return 0;
 }
 
-static int write_sparse_data_chunk(struct output_file *out, unsigned int len,
+static int write_sparse_data_chunk(struct output_file *out, int64_t len,
 		void *data)
 {
 	chunk_header_t chunk_header;
@@ -422,6 +426,7 @@ static int write_sparse_data_chunk(struct output_file *out, unsigned int len,
 	if (ret < 0)
 		return -1;
 	if (zero_len) {
+		/* only happens in last chunk */
 		ret = out->ops->write(out, out->zero_buf, zero_len);
 		if (ret < 0)
 			return -1;
@@ -472,7 +477,7 @@ static struct sparse_file_ops sparse_file_ops = {
 		.write_end_chunk = write_sparse_end_chunk,
 };
 
-static int write_normal_data_chunk(struct output_file *out, unsigned int len,
+static int write_normal_data_chunk(struct output_file *out, int64_t len,
 		void *data)
 {
 	int ret;
@@ -490,7 +495,7 @@ static int write_normal_data_chunk(struct output_file *out, unsigned int len,
 	return ret;
 }
 
-static int write_normal_fill_chunk(struct output_file *out, unsigned int len,
+static int write_normal_fill_chunk(struct output_file *out, int64_t len,
 		uint32_t fill_val)
 {
 	int ret;
@@ -515,8 +520,9 @@ static int write_normal_fill_chunk(struct output_file *out, unsigned int len,
 	return 0;
 }
 
-static int write_normal_skip_chunk(struct output_file *out, int64_t len)
+static int write_normal_skip_chunk(struct output_file *out, int64_t len, bool last_block)
 {
+	bool tmp = last_block;
 	return out->ops->skip(out, len);
 }
 
@@ -550,11 +556,13 @@ static int output_file_init(struct output_file *out, int block_size,
 	out->crc32 = 0;
 	out->use_crc = crc;
 
-	out->zero_buf = calloc(block_size, 1);
+	out->zero_buf = malloc(block_size);
 	if (!out->zero_buf) {
 		error_errno("malloc zero_buf");
 		return -ENOMEM;
 	}
+	/* used for last chunk, filled with 0xFF for most flash */
+	memset(out->zero_buf, 0xFF, block_size);
 
 	out->fill_buf = calloc(block_size, 1);
 	if (!out->fill_buf) {
@@ -577,7 +585,7 @@ static int output_file_init(struct output_file *out, int block_size,
 				.file_hdr_sz = SPARSE_HEADER_LEN,
 				.chunk_hdr_sz = CHUNK_HEADER_LEN,
 				.blk_sz = out->block_size,
-				.total_blks = out->len / out->block_size,
+				.total_blks = DIV_ROUND_UP(out->len, out->block_size),
 				.total_chunks = chunks,
 				.image_checksum = 0
 		};
@@ -627,7 +635,7 @@ static struct output_file *output_file_new_normal(void)
 	return &outn->out;
 }
 
-struct output_file *output_file_open_callback(int (*write)(void *, const void *, int),
+struct output_file *output_file_open_callback(int (*write)(void *, const void *, int64_t),
 		void *priv, unsigned int block_size, int64_t len,
 		int gz __unused, int sparse, int chunks, int crc)
 {
@@ -680,25 +688,25 @@ struct output_file *output_file_open_fd(int fd, unsigned int block_size, int64_t
 }
 
 /* Write a contiguous region of data blocks from a memory buffer */
-int write_data_chunk(struct output_file *out, unsigned int len, void *data)
+int write_data_chunk(struct output_file *out, int64_t len, void *data)
 {
 	return out->sparse_ops->write_data_chunk(out, len, data);
 }
 
 /* Write a contiguous region of data blocks with a fill value */
-int write_fill_chunk(struct output_file *out, unsigned int len,
+int write_fill_chunk(struct output_file *out, int64_t len,
 		uint32_t fill_val)
 {
 	return out->sparse_ops->write_fill_chunk(out, len, fill_val);
 }
 
-int write_fd_chunk(struct output_file *out, unsigned int len,
+int write_fd_chunk(struct output_file *out, int64_t len,
 		int fd, int64_t offset)
 {
 	int ret;
-	int64_t aligned_offset;
-	int aligned_diff;
-	int buffer_size;
+	off64_t aligned_offset;
+	int64_t aligned_diff;
+	int64_t buffer_size;
 	char *ptr;
 
 	aligned_offset = offset & ~(4096 - 1);
@@ -743,7 +751,7 @@ int write_fd_chunk(struct output_file *out, unsigned int len,
 }
 
 /* Write a contiguous region of data blocks from a file */
-int write_file_chunk(struct output_file *out, unsigned int len,
+int write_file_chunk(struct output_file *out, int64_t len,
 		const char *file, int64_t offset)
 {
 	int ret;
@@ -760,7 +768,7 @@ int write_file_chunk(struct output_file *out, unsigned int len,
 	return ret;
 }
 
-int write_skip_chunk(struct output_file *out, int64_t len)
+int write_skip_chunk(struct output_file *out, int64_t len, bool last_block)
 {
-	return out->sparse_ops->write_skip_chunk(out, len);
+	return out->sparse_ops->write_skip_chunk(out, len, last_block);
 }
