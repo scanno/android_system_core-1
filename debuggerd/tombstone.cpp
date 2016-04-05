@@ -802,13 +802,9 @@ char* engrave_tombstone(pid_t pid, pid_t tid, int signal, int original_si_code,
     _LOG(&log, logtype::ERROR, "failed to change ownership of %s: %s\n", TOMBSTONE_DIR, strerror(errno));
   }
   /* END IKMAP-4768; IKMAP-5931 */
+
   int fd = -1;
-  char* path = NULL;
-  if (selinux_android_restorecon(TOMBSTONE_DIR, 0) == 0) {
-    path = find_and_open_tombstone(&fd);
-  } else {
-    _LOG(&log, logtype::ERROR, "Failed to restore security context, not writing tombstone.\n");
-  }
+  char* path = find_and_open_tombstone(&fd);
 
   if (fd < 0) {
     _LOG(&log, logtype::ERROR, "Skipping tombstone write, nothing to do.\n");
